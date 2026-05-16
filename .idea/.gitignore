@@ -1,0 +1,38 @@
+# Виртуальное окружение (то самое, из-за которого у вас 9990 файлов)
+venv_fix/
+venv/
+ENV/
+env/
+
+# Кэш Python
+**/__pycache__/
+*.py[cod]
+*$py.class
+
+# Файлы настроек IDE (PyCharm и VS Code)
+.idea/
+.vscode/
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.swp
+
+# Базы данных и системные файлы
+*.db
+.DS_Store
+Thumbs.db
+
+# Веса моделей, чекпоинты и логи (чтобы не забить GitHub гигабайтами)
+*.pt
+*.pth
+*.onnx
+*.weights
+runs/
+logs/
+checkpoints/
+
+# Датасеты (если качаете их внутрь папки проекта)
+datasets/
+data/*.zip
+data/*.tar.gz
