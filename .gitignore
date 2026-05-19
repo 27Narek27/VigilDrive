@@ -1,0 +1,5 @@
+venv_fix/
+__pycache__/
+*.pyc
+*.db
+vigil_model_v7_best.pth

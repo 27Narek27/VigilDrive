@@ -54,7 +54,6 @@ def send_telegram_photo(chat_id: str, photo_bytes: bytes, caption: str):
     )
 
 def send_telegram_location(chat_id: str, lat: float, lon: float):
-    """Отправляет геопозицию как интерактивную карту в Telegram."""
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendLocation"
     requests.post(
         url,
@@ -108,7 +107,6 @@ def subscribe(driver_code: str = Form(...), chat_id: str = Form(...)):
 async def alert(
     driver_code: str = Form(...),
     screenshot:  UploadFile = File(...),
-    # ── Координаты от клиента ──────────────────────────────────────────────
     lat:         str = Form(default=""),
     lon:         str = Form(default=""),
     address:     str = Form(default=""),
@@ -116,6 +114,7 @@ async def alert(
     country:     str = Form(default=""),
     maps_link:   str = Form(default=""),
     timestamp:   str = Form(default=""),
+    accuracy:    str = Form(default=""),   # ← НОВЫЙ ПАРАМЕТР
 ):
     with get_db() as db:
         driver = db.execute("SELECT * FROM drivers WHERE driver_code=?",
@@ -127,24 +126,29 @@ async def alert(
 
     photo_bytes = await screenshot.read()
 
-    # ── Парсим координаты ─────────────────────────────────────────────────
     try:
         lat_f = float(lat) if lat else None
         lon_f = float(lon) if lon else None
     except ValueError:
         lat_f = lon_f = None
 
-    # ── Собираем подпись к фото ───────────────────────────────────────────
+    # ── Строка с локацией ─────────────────────────────────────────────────────
     location_line = ""
     if maps_link and maps_link != "Location unavailable":
         location_line = f"\n📍 [Открыть на карте]({maps_link})"
     elif lat_f and lon_f:
-        location_line = f"\n📍 Координаты: `{lat_f:.5f}, {lon_f:.5f}`"
+        location_line = f"\n📍 Координаты: `{lat_f:.6f}, {lon_f:.6f}`"
     else:
         location_line = "\n📍 Геолокация недоступна"
 
     if city or country:
         location_line += f"\n🏙 {city}{', ' + country if country else ''}"
+
+    # ── Точность GPS ──────────────────────────────────────────────────────────
+    if accuracy and accuracy not in ("N/A", "IP", ""):
+        location_line += f"\n🎯 Точность: {accuracy}"
+    elif not accuracy or accuracy == "IP":
+        location_line += f"\n⚠️ Координаты приблизительные (IP)"
 
     if timestamp:
         try:
@@ -165,9 +169,7 @@ async def alert(
     for sub in subs:
         cid = sub["chat_id"]
         try:
-            # 1. Отправляем фото с подписью и ссылкой
             send_telegram_photo(cid, photo_bytes, caption)
-            # 2. Отправляем интерактивную геопозицию (карта прямо в чате)
             if lat_f is not None and lon_f is not None:
                 send_telegram_location(cid, lat_f, lon_f)
             sent += 1

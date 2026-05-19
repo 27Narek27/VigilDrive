@@ -1,11 +1,3 @@
-"""
-VigilDrive GUI v10.0
-Changes vs v9:
-  - Прямоугольники вокруг глаз (Haar cascade координаты)
-  - Геолокация отправляется вместе со скриншотом (geocoder, IP-based)
-  - Звук НЕ останавливается пока глаза не откроются (is_beeping управляется eye_state)
-"""
-
 import customtkinter as ctk
 import cv2
 from PIL import Image, ImageTk
@@ -18,9 +10,12 @@ import sounddevice as sd
 import threading
 import requests
 import datetime
+import webbrowser
+from http.server import HTTPServer, BaseHTTPRequestHandler
+import json as _json
 import io
-import geocoder
 from collections import deque
+import mediapipe as mp
 
 ctk.set_appearance_mode("dark")
 
@@ -28,6 +23,18 @@ SERVER_URL      = "http://localhost:8000"
 SOUND_THRESHOLD = 2.0
 ALERT_THRESHOLD = 15.0
 GRACE_PERIOD    = 1.2
+
+# ── EAR настройки ─────────────────────────────────────────────────────────────
+# EAR (Eye Aspect Ratio) — отношение высоты к ширине глаза
+# Когда глаз закрыт → EAR ≈ 0.0–0.15
+# Когда глаз открыт → EAR ≈ 0.25–0.35
+EAR_THRESHOLD       = 0.20   # ниже этого → глаза закрыты
+EAR_CONSEC_FRAMES   = 2      # сколько кадров подряд EAR < порога → засчитать закрытие
+
+# MediaPipe landmark индексы для левого и правого глаза (Face Mesh 468 точек)
+# Порядок: p1(верх), p2(верх-прав), p3(низ-прав), p4(низ), p5(низ-лев), p6(верх-лев)
+LEFT_EYE_IDX  = [362, 385, 387, 263, 373, 380]
+RIGHT_EYE_IDX = [33,  160, 158, 133, 153, 144]
 
 # ── UI Colors ─────────────────────────────────────────────────────────────────
 C_BG     = "#080C10"
@@ -43,7 +50,7 @@ C_TEXT   = "#E8F4FD"
 C_MUTED  = "#4A6FA5"
 C_DIM    = "#1E2D3D"
 
-MODEL_PATH = "vigil_model_v4_combined.pth"
+MODEL_PATH = "vigil_model_v7_best.pth"   # используем v7, более новый
 MODEL_ARCH = "efficientnet_b0"
 
 CONFIDENCE_THRESHOLD = 0.72
@@ -51,23 +58,169 @@ DROWSY_WINDOW        = 20
 DROWSY_TRIGGER_RATIO = 0.55
 
 
-# ── Geolocation (IP-based, no GPS needed) ─────────────────────────────────────
-def get_location() -> dict:
-    """Returns lat/lon/address or fallback if offline."""
+# ── Геолокация: GPS через браузер → fallback IP ───────────────────────────────
+_gps_result: dict = {}   # заполняется из браузера
+
+class _GpsHandler(BaseHTTPRequestHandler):
+    """Принимает GPS координаты от браузера через localhost."""
+    def do_POST(self):
+        length = int(self.headers.get("Content-Length", 0))
+        body   = self.rfile.read(length)
+        try:
+            data = _json.loads(body)
+            _gps_result.update(data)
+        except Exception:
+            pass
+        self.send_response(200)
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.end_headers()
+        self.wfile.write(b"ok")
+
+    def do_OPTIONS(self):
+        self.send_response(200)
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Access-Control-Allow-Methods", "POST, OPTIONS")
+        self.send_header("Access-Control-Allow-Headers", "Content-Type")
+        self.end_headers()
+
+    def log_message(self, *args):
+        pass   # подавляем лишние логи
+
+
+def request_gps_from_browser():
+    """
+    Открывает браузер со страницей которая запрашивает GPS
+    и отправляет координаты обратно на localhost:9999.
+    Ждёт до 15 секунд.
+    """
+    html = """<!DOCTYPE html><html><head><meta charset="utf-8">
+<title>VigilDrive GPS</title>
+<style>
+  body{margin:0;background:#080C10;color:#E8F4FD;font-family:Consolas,monospace;
+       display:flex;align-items:center;justify-content:center;height:100vh;flex-direction:column;gap:16px}
+  .box{background:#131920;border:1px solid #1E2D3D;border-radius:12px;padding:32px 48px;text-align:center}
+  h2{color:#00D4FF;margin:0 0 8px} p{color:#4A6FA5;margin:0 0 16px;font-size:13px}
+  .ok{color:#00E5A0} .err{color:#FF3B5C}
+</style></head><body><div class="box">
+<h2>🛰 VIGIL DRIVE — GPS</h2>
+<p id="msg">Запрашиваем точные координаты...</p>
+<div id="status"></div></div>
+<script>
+function send(lat,lon,acc){
+  fetch('http://127.0.0.1:9999',{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({lat:lat,lon:lon,accuracy:acc,source:'gps'})})
+  .then(()=>{
+    document.getElementById('msg').className='ok';
+    document.getElementById('msg').textContent='✅ Координаты получены! Можно закрыть вкладку.';
+    document.getElementById('status').textContent='📍 '+lat.toFixed(6)+', '+lon.toFixed(6)+' (±'+Math.round(acc)+'м)';
+    setTimeout(()=>window.close(),2000);
+  }).catch(()=>{});
+}
+navigator.geolocation.getCurrentPosition(
+  p=>send(p.coords.latitude,p.coords.longitude,p.coords.accuracy),
+  e=>{
+    document.getElementById('msg').className='err';
+    document.getElementById('msg').textContent='❌ GPS недоступен: '+e.message;
+  },
+  {enableHighAccuracy:true,timeout:12000,maximumAge:0}
+);
+</script></body></html>"""
+
+    # Запускаем временный HTTP сервер на 9999
+    _gps_result.clear()
+    server = HTTPServer(("127.0.0.1", 9999), _GpsHandler)
+    server.timeout = 1
+
+    # Создаём HTML файл и открываем в браузере
+    import tempfile, os
+    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".html",
+                                     mode="w", encoding="utf-8")
+    tmp.write(html)
+    tmp.flush()
+    tmp.close()
+    webbrowser.open(f"file://{tmp.name}")
+
+    # Ждём ответа максимум 15 секунд
+    deadline = time.time() + 15
+    while time.time() < deadline:
+        server.handle_request()
+        if _gps_result.get("lat"):
+            break
+
+    server.server_close()
     try:
-        g = geocoder.ip("me")
-        if g.ok:
-            return {
-                "lat":     g.latlng[0],
-                "lon":     g.latlng[1],
-                "address": g.address or "Unknown",
-                "city":    g.city    or "",
-                "country": g.country or "",
-            }
+        os.unlink(tmp.name)
     except Exception:
         pass
-    return {"lat": None, "lon": None, "address": "Location unavailable",
-            "city": "", "country": ""}
+
+    return _gps_result.copy()
+
+
+def get_location() -> dict:
+    """GPS через браузер (точность 5-20м), fallback — IP геолокация."""
+    FALLBACK = {"lat": None, "lon": None, "address": "Location unavailable",
+                "city": "", "country": "", "accuracy": None}
+
+    # Шаг 1: точный GPS из браузера
+    gps = request_gps_from_browser()
+    if gps.get("lat") and gps.get("lon"):
+        lat, lon = gps["lat"], gps["lon"]
+        acc = gps.get("accuracy")
+        # Обратное геокодирование через nominatim
+        try:
+            r = requests.get(
+                f"https://nominatim.openstreetmap.org/reverse"
+                f"?lat={lat}&lon={lon}&format=json",
+                headers={"User-Agent": "VigilDrive/1.0"},
+                timeout=5)
+            d = r.json()
+            addr = d.get("address", {})
+            city    = addr.get("city") or addr.get("town") or addr.get("village") or ""
+            country = addr.get("country", "")
+            road    = addr.get("road", "")
+            display = f"{road}, {city}".strip(", ")
+        except Exception:
+            city, country, display = "", "", f"{lat:.5f},{lon:.5f}"
+        return {"lat": lat, "lon": lon, "address": display,
+                "city": city, "country": country, "accuracy": acc}
+
+    # Шаг 2: fallback — IP геолокация (точность ~город)
+    try:
+        r = requests.get(
+            "http://ip-api.com/json/?fields=status,lat,lon,city,country,regionName",
+            timeout=5)
+        d = r.json()
+        if d.get("status") == "success":
+            return {"lat": d["lat"], "lon": d["lon"],
+                    "address": d.get("regionName", ""),
+                    "city": d.get("city", ""), "country": d.get("country", ""),
+                    "accuracy": None}
+    except Exception:
+        pass
+
+    return FALLBACK
+
+
+# ── EAR формула ───────────────────────────────────────────────────────────────
+def eye_aspect_ratio(landmarks, eye_indices, w, h):
+    """
+    Вычисляет EAR по 6 точкам глаза.
+    landmarks — список (x_norm, y_norm) от MediaPipe
+    """
+    pts = []
+    for idx in eye_indices:
+        lm = landmarks[idx]
+        pts.append((lm.x * w, lm.y * h))
+
+    # Вертикальные расстояния (2 пары)
+    A = np.linalg.norm(np.array(pts[1]) - np.array(pts[5]))
+    B = np.linalg.norm(np.array(pts[2]) - np.array(pts[4]))
+    # Горизонтальное расстояние
+    C = np.linalg.norm(np.array(pts[0]) - np.array(pts[3]))
+
+    if C < 1e-6:
+        return 0.0
+    return (A + B) / (2.0 * C)
 
 
 class RingProgressBar(ctk.CTkCanvas):
@@ -156,7 +309,7 @@ def _load_model(arch: str, path: str, device: torch.device):
 class VigilDriveFinal(ctk.CTk):
     def __init__(self):
         super().__init__()
-        self.title("VigilDrive AI  ·  v10.0")
+        self.title("VigilDrive AI  ·  v11.0")
         self.geometry("1280x800")
         self.minsize(1100, 700)
         self.configure(fg_color=C_BG)
@@ -177,10 +330,21 @@ class VigilDriveFinal(ctk.CTk):
             transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
         ])
 
-        self.face_cascade = cv2.CascadeClassifier(
-            cv2.data.haarcascades + 'haarcascade_frontalface_default.xml')
-        self.eye_cascade  = cv2.CascadeClassifier(
-            cv2.data.haarcascades + 'haarcascade_eye.xml')
+        # ── MediaPipe Face Mesh ───────────────────────────────────────────────
+        self.mp_face_mesh = mp.solutions.face_mesh
+        self.face_mesh    = self.mp_face_mesh.FaceMesh(
+            max_num_faces=1,
+            refine_landmarks=True,       # нужно для точных контуров глаз
+            min_detection_confidence=0.5,
+            min_tracking_confidence=0.5,
+        )
+        self.mp_drawing      = mp.solutions.drawing_utils
+        self.mp_drawing_spec = self.mp_drawing.DrawingSpec(
+            color=(0, 200, 255), thickness=1, circle_radius=1)
+
+        # EAR счётчик подряд идущих кадров с закрытыми глазами
+        self._ear_counter = 0
+        self._last_ear    = 1.0    # для отображения
 
         # State
         self.is_running        = False
@@ -193,8 +357,6 @@ class VigilDriveFinal(ctk.CTk):
         self.alert_sent        = False
         self._eye_open_start   = None
         self._drowsy_window: deque = deque(maxlen=DROWSY_WINDOW)
-
-        # Кэшируем геолокацию при старте (IP редко меняется)
         self._location_cache   = None
 
         self._build_ui()
@@ -224,7 +386,7 @@ class VigilDriveFinal(ctk.CTk):
                      text_color=C_ACCENT).pack(side="left")
         ctk.CTkLabel(lf, text="DRIVE", font=("Consolas", 28, "bold"),
                      text_color=C_TEXT).pack(side="left")
-        self._lbl(sb, "Driver Monitoring System  v10.0", 9).pack(pady=(0,12))
+        self._lbl(sb, "Driver Monitoring System  v11.0", 9).pack(pady=(0,12))
         self._sep(sb)
 
         self._lbl(sb, "DRIVER CODE", 9).pack(padx=20, anchor="w")
@@ -260,6 +422,9 @@ class VigilDriveFinal(ctk.CTk):
         self.lbl_status.pack(pady=(12,4))
         self.lbl_conf = self._lbl(sc, "Confidence: —", 10)
         self.lbl_conf.pack(pady=(0,4))
+        # ── Новые метки для EAR ──────────────────────────────────────────────
+        self.lbl_ear  = self._lbl(sc, "EAR: —", 10)
+        self.lbl_ear.pack(pady=(0,4))
         self.lbl_ratio = self._lbl(sc, "Drowsy ratio: —", 10)
         self.lbl_ratio.pack(pady=(0,4))
         self.lbl_geo = self._lbl(sc, "Location: —", 9)
@@ -291,6 +456,7 @@ class VigilDriveFinal(ctk.CTk):
             ("♪", "Sound alarm",  f"{SOUND_THRESHOLD:.0f}s",  C_YELLOW),
             ("⚡","Send alert",    f"{ALERT_THRESHOLD:.0f}s",  C_RED),
             ("⏱","Grace period", f"{GRACE_PERIOD:.1f}s",     C_ACCENT),
+            ("👁","EAR thresh",   f"{EAR_THRESHOLD:.2f}",     C_GREEN),
         ]:
             r2 = ctk.CTkFrame(tc, fg_color="transparent")
             r2.pack(fill="x", padx=12, pady=2)
@@ -369,12 +535,11 @@ class VigilDriveFinal(ctk.CTk):
                                     fg_color=C_RED, hover_color="#CC2244")
             self.video_label.configure(text="")
             self._reset()
-            # Получаем геолокацию в фоне при старте
             threading.Thread(target=self._update_location, daemon=True).start()
             self.stream()
         else:
             self.is_running  = False
-            self.is_beeping  = False   # остановить звук
+            self.is_beeping  = False
             self.cap.release()
             self.btn_main.configure(text="▶  START MONITORING",
                                     fg_color=C_GREEN, hover_color="#00B87A")
@@ -387,9 +552,16 @@ class VigilDriveFinal(ctk.CTk):
     def _update_location(self):
         loc = get_location()
         self._location_cache = loc
-        display = loc["city"] or loc["address"]
-        self.after(0, lambda: self.lbl_geo.configure(
-            text=f"📍 {display[:30]}", text_color=C_ACCENT))
+        city = loc.get("city") or loc.get("address") or "Unknown"
+        acc  = loc.get("accuracy")
+        if acc is not None:
+            acc_str = f" ±{int(acc)}м"
+            clr = C_GREEN   # точный GPS
+        else:
+            acc_str = " (IP)"
+            clr = C_YELLOW  # приблизительный IP
+        txt = f"📍 {city[:22]}{acc_str}"
+        self.after(0, lambda: self.lbl_geo.configure(text=txt, text_color=clr))
 
     def _reset(self):
         self.eyes_closed_since = None
@@ -400,13 +572,9 @@ class VigilDriveFinal(ctk.CTk):
         self.is_beeping        = False
         self._eye_open_start   = None
         self._drowsy_window.clear()
+        self._ear_counter      = 0
 
-    # ── Генерация звукового тона напрямую в аудио драйвер ──────────────────
     def _beep(self, freq: int, duration_ms: int, volume: float = 1.0):
-        """
-        Генерирует синусоиду и пишет напрямую в sounddevice.
-        Обходит системный микшер Windows (Fn+F1 mute не влияет).
-        """
         sr      = 44100
         samples = int(sr * duration_ms / 1000)
         t       = np.linspace(0, duration_ms / 1000, samples, endpoint=False)
@@ -414,7 +582,6 @@ class VigilDriveFinal(ctk.CTk):
         sd.play(wave, samplerate=sr)
         sd.wait()
 
-    # ── Звук: крутится пока is_beeping=True (глаза не открылись) ─────────────
     def _play_sound(self):
         while self.is_beeping:
             ec = self.eyes_closed_sec
@@ -432,54 +599,69 @@ class VigilDriveFinal(ctk.CTk):
                 self._beep(650,  50)
             time.sleep(0.02)
 
-    # ── Детекция глаз + рисование прямоугольников ────────────────────────────
-    def detect_eyes(self, frame_bgr, img_rgb):
+    # ── MediaPipe EAR детекция ────────────────────────────────────────────────
+    def detect_eyes_mediapipe(self, frame_bgr, img_rgb):
         """
-        Рисует прямоугольники вокруг лица и глаз прямо на img_rgb.
-        Возвращает: True (глаза найдены) | False (лицо есть, глаз нет) | None (нет лица)
+        Использует MediaPipe Face Mesh для точного вычисления EAR.
+
+        Возвращает:
+            eyes_open (bool | None):
+                True  — глаза открыты (EAR > порога)
+                False — глаза закрыты (EAR < порога несколько кадров подряд)
+                None  — лицо не найдено
+            ear_value (float): текущий EAR для отображения
         """
-        gray  = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
-        gray  = cv2.equalizeHist(gray)
-        faces = self.face_cascade.detectMultiScale(gray, 1.2, 5, minSize=(80, 80))
+        h, w = frame_bgr.shape[:2]
+        # MediaPipe работает с RGB
+        results = self.face_mesh.process(img_rgb)
 
-        if len(faces) == 0:
-            return None
+        if not results.multi_face_landmarks:
+            self._ear_counter = 0
+            return None, 0.0
 
-        found_open = False
-        for (fx, fy, fw, fh) in faces:
-            # Прямоугольник вокруг лица (синий)
-            cv2.rectangle(img_rgb,
-                          (fx, fy), (fx + fw, fy + fh),
-                          (0, 200, 255), 2)
-            cv2.putText(img_rgb, "FACE",
-                        (fx, fy - 6), cv2.FONT_HERSHEY_SIMPLEX,
-                        0.45, (0, 200, 255), 1, cv2.LINE_AA)
+        face_landmarks = results.multi_face_landmarks[0].landmark
 
-            # Ищем глаза только в верхней половине лица
-            roi_gray = gray[fy : fy + fh//2, fx : fx + fw]
-            eyes = self.eye_cascade.detectMultiScale(roi_gray, 1.1, 8, minSize=(18, 18))
+        # Вычисляем EAR для обоих глаз, берём среднее
+        left_ear  = eye_aspect_ratio(face_landmarks, LEFT_EYE_IDX,  w, h)
+        right_ear = eye_aspect_ratio(face_landmarks, RIGHT_EYE_IDX, w, h)
+        avg_ear   = (left_ear + right_ear) / 2.0
 
-            for (ex, ey, ew, eh) in eyes:
-                # Координаты в исходном кадре
-                abs_x = fx + ex
-                abs_y = fy + ey
-                # Прямоугольник вокруг глаза (зелёный)
-                cv2.rectangle(img_rgb,
-                              (abs_x, abs_y), (abs_x + ew, abs_y + eh),
-                              (0, 255, 160), 2)
-                cv2.putText(img_rgb, "EYE",
-                            (abs_x, abs_y - 4), cv2.FONT_HERSHEY_SIMPLEX,
-                            0.38, (0, 255, 160), 1, cv2.LINE_AA)
-                found_open = True
+        # ── Рисуем контур глаз на кадре ──────────────────────────────────────
+        eye_color = (0, 255, 160) if avg_ear > EAR_THRESHOLD else (255, 59, 92)
 
-        return found_open if found_open else False
+        for eye_indices in [LEFT_EYE_IDX, RIGHT_EYE_IDX]:
+            pts = []
+            for idx in eye_indices:
+                lm  = face_landmarks[idx]
+                pts.append((int(lm.x * w), int(lm.y * h)))
+            # Рисуем контур глаза
+            for i in range(len(pts)):
+                cv2.line(img_rgb, pts[i], pts[(i+1) % len(pts)], eye_color, 1)
+            # Точки углов
+            cv2.circle(img_rgb, pts[0], 3, eye_color, -1)
+            cv2.circle(img_rgb, pts[3], 3, eye_color, -1)
 
-    # ── Отправка алерта с геолокацией ────────────────────────────────────────
+        # EAR значение на экране
+        cv2.putText(img_rgb, f"EAR {avg_ear:.3f}",
+                    (14, 54), cv2.FONT_HERSHEY_SIMPLEX,
+                    0.5, eye_color, 1, cv2.LINE_AA)
+
+        # ── Логика EAR счётчика ───────────────────────────────────────────────
+        if avg_ear < EAR_THRESHOLD:
+            self._ear_counter += 1
+        else:
+            self._ear_counter = 0
+
+        # Засчитываем закрытие только если несколько кадров подряд
+        eyes_open = self._ear_counter < EAR_CONSEC_FRAMES
+
+        return eyes_open, avg_ear
+
+    # ── Отправка алерта ───────────────────────────────────────────────────────
     def send_alert(self, frame_bgr):
         _, buf = cv2.imencode(".jpg", frame_bgr)
         bio = io.BytesIO(buf.tobytes())
 
-        # Если кэш пустой — запрашиваем синхронно, чтобы координаты ушли с фото
         if not self._location_cache:
             self._location_cache = get_location()
 
@@ -490,12 +672,8 @@ class VigilDriveFinal(ctk.CTk):
         city    = loc.get("city", "")
         country = loc.get("country", "")
 
-        loc_str = (
-            f"Lat: {lat if lat is not None else 'N/A'}, "
-            f"Lon: {lon if lon is not None else 'N/A'} | "
-            f"{city}{', ' + country if country else ''} | "
-            f"{address}"
-        )
+        acc  = loc.get("accuracy")
+        acc_str = f"±{int(acc)}м" if acc is not None else ("IP" if lat else "N/A")
         maps_link = (
             f"https://www.google.com/maps?q={lat},{lon}"
             if lat is not None and lon is not None
@@ -512,8 +690,8 @@ class VigilDriveFinal(ctk.CTk):
                     "address":     address,
                     "city":        city,
                     "country":     country,
-                    "location":    loc_str,
                     "maps_link":   maps_link,
+                    "accuracy":    acc_str,
                     "timestamp":   datetime.datetime.now().isoformat(),
                 },
                 files={"screenshot": ("alert.jpg", bio, "image/jpeg")},
@@ -546,7 +724,7 @@ class VigilDriveFinal(ctk.CTk):
         frame   = cv2.flip(frame, 1)
         img_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
 
-        # 1. CNN prediction
+        # 1. CNN prediction (вспомогательный сигнал)
         state, confidence = "Non Drowsy", 0.0
         if self.model is not None:
             inp = self.transform(Image.fromarray(img_rgb)).unsqueeze(0).to(self.DEVICE)
@@ -555,31 +733,42 @@ class VigilDriveFinal(ctk.CTk):
                 conf, pred = torch.max(prob, 1)
             state, confidence = self.CLASSES[pred.item()], conf.item()
 
-        # 2. Rolling window
+        # 2. Rolling window для CNN
         is_drowsy_frame = (state == 'Drowsy' and confidence >= CONFIDENCE_THRESHOLD)
         self._drowsy_window.append(1 if is_drowsy_frame else 0)
         drowsy_ratio     = sum(self._drowsy_window) / max(len(self._drowsy_window), 1)
         drowsy_sustained = (drowsy_ratio >= DROWSY_TRIGGER_RATIO
                             and len(self._drowsy_window) >= DROWSY_WINDOW // 2)
 
-        self.lbl_conf.configure(text=f"Confidence: {confidence:.0%}  [{state}]")
+        self.lbl_conf.configure(text=f"CNN: {confidence:.0%}  [{state}]")
         self.lbl_ratio.configure(
             text=f"Drowsy ratio: {drowsy_ratio:.0%}",
             text_color=C_RED if drowsy_sustained else C_MUTED)
 
-        # 3. Детекция глаз + рисование прямоугольников
-        eye_result = self.detect_eyes(frame, img_rgb)
+        # 3. ── ГЛАВНАЯ ДЕТЕКЦИЯ: MediaPipe EAR ────────────────────────────────
+        #    CNN теперь только дополнительный сигнал, НЕ основной
+        ear_result, ear_val = self.detect_eyes_mediapipe(frame, img_rgb)
+        self._last_ear = ear_val
 
-        if eye_result is True:
+        ear_color = C_GREEN if ear_val > EAR_THRESHOLD else C_RED
+        self.lbl_ear.configure(
+            text=f"EAR: {ear_val:.3f}  (thresh {EAR_THRESHOLD:.2f})",
+            text_color=ear_color)
+
+        # ── Решение: EAR главный, CNN — страховка ─────────────────────────────
+        if ear_result is True:
+            # MediaPipe уверен: глаза открыты
             eyes_open = True
-        elif eye_result is None:
-            eyes_open = not drowsy_sustained
+        elif ear_result is False:
+            # MediaPipe уверен: глаза закрыты
+            eyes_open = False
         else:
+            # Лицо не найдено — используем CNN как fallback
             eyes_open = not drowsy_sustained
 
         now = time.time()
 
-        # 4. Timer логика
+        # 4. Timer логика (без изменений)
         if eyes_open:
             self.last_open_ts = now
             if self._eye_open_start is None:
@@ -590,7 +779,6 @@ class VigilDriveFinal(ctk.CTk):
                 self.eyes_closed_sec   = 0.0
                 self.sound_sent        = False
                 self.alert_sent        = False
-                # ── Останавливаем звук только когда глаза открылись ──────────
                 self.is_beeping        = False
         else:
             self._eye_open_start = None
@@ -610,7 +798,7 @@ class VigilDriveFinal(ctk.CTk):
         # 5. Alerts
         if ec >= SOUND_THRESHOLD and not self.sound_sent:
             self.sound_sent = True
-            self.is_beeping = True   # флаг: звук идёт пока глаза закрыты
+            self.is_beeping = True
             threading.Thread(target=self._play_sound, daemon=True).start()
 
         if ec >= ALERT_THRESHOLD and not self.alert_sent:
@@ -631,7 +819,7 @@ class VigilDriveFinal(ctk.CTk):
         self.ring.set(1.0 - prog, rc)
         self.lbl_status.configure(text=st, text_color=sc)
 
-        # 7. Overlay на кадр
+        # 7. Overlay
         h, w = img_rgb.shape[:2]
         L, T = 28, 3
         for (cx2, cy2, sx, sy) in [(0,0,1,1),(w,0,-1,1),(0,h,1,-1),(w,h,-1,-1)]:
