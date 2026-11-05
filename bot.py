@@ -1,7 +1,7 @@
 import telebot
 import requests
-BOT_TOKEN   = "8693711674:AAEvo0P4NWUscYd2RJ7sRgIiWlWHhysz-wM"     
-SERVER_URL  = "http://localhost:8000"
+from settings import get_bot_token, SERVER_URL
+BOT_TOKEN = get_bot_token()
 
 bot = telebot.TeleBot(BOT_TOKEN)
 

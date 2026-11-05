@@ -1,11 +1,13 @@
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 import sqlite3, requests, random, string
+from telegram_delivery import post_telegram
 
 app = FastAPI()
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
-BOT_TOKEN = "8693711674:AAEvo0P4NWUscYd2RJ7sRgIiWlWHhysz-wM"
+from settings import get_bot_token
+BOT_TOKEN = get_bot_token()
 DB_PATH   = "vigildrive.db"
 
 def get_db():
@@ -46,7 +48,7 @@ def make_code():
 
 def send_telegram_photo(chat_id: str, photo_bytes: bytes, caption: str):
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendPhoto"
-    requests.post(
+    post_telegram(
         url,
         data={"chat_id": chat_id, "caption": caption, "parse_mode": "Markdown"},
         files={"photo": ("alert.jpg", photo_bytes, "image/jpeg")},
@@ -55,7 +57,7 @@ def send_telegram_photo(chat_id: str, photo_bytes: bytes, caption: str):
 
 def send_telegram_location(chat_id: str, lat: float, lon: float):
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendLocation"
-    requests.post(
+    post_telegram(
         url,
         json={"chat_id": chat_id, "latitude": lat, "longitude": lon},
         timeout=10,
@@ -63,7 +65,7 @@ def send_telegram_location(chat_id: str, lat: float, lon: float):
 
 def send_telegram_text(chat_id: str, text: str):
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
-    requests.post(
+    post_telegram(
         url,
         json={"chat_id": chat_id, "text": text, "parse_mode": "Markdown"},
         timeout=10,

@@ -19,7 +19,7 @@ import mediapipe as mp
 
 ctk.set_appearance_mode("dark")
 
-SERVER_URL      = "http://localhost:8000"
+from settings import SERVER_URL, ROOT
 SOUND_THRESHOLD = 2.0
 ALERT_THRESHOLD = 15.0
 GRACE_PERIOD    = 1.2
@@ -50,7 +50,7 @@ C_TEXT   = "#E8F4FD"
 C_MUTED  = "#4A6FA5"
 C_DIM    = "#1E2D3D"
 
-MODEL_PATH = "vigil_model_v7_best.pth"   # используем v7, более новый
+MODEL_PATH = str(ROOT / "vigil_model_v7_best.pth")
 MODEL_ARCH = "efficientnet_b0"
 
 CONFIDENCE_THRESHOLD = 0.72
@@ -524,11 +524,16 @@ class VigilDriveFinal(ctk.CTk):
 
     def toggle(self):
         if not self.is_running:
+            if self.model is None:
+                self.lbl_code_ok.configure(text="Model unavailable: check checkpoint", text_color=C_RED)
+                return
             if not self.driver_code:
                 self.lbl_code_ok.configure(text="✗ Enter code first!", text_color=C_YELLOW)
                 return
             self.cap = cv2.VideoCapture(0)
             if not self.cap.isOpened():
+                self.cap.release()
+                self.lbl_code_ok.configure(text="Camera unavailable: check permissions", text_color=C_RED)
                 return
             self.is_running = True
             self.btn_main.configure(text="■  STOP MONITORING",
@@ -700,9 +705,10 @@ class VigilDriveFinal(ctk.CTk):
             if r.ok:
                 n   = r.json().get("sent_to", 0)
                 hts = datetime.datetime.now().strftime("%H:%M:%S")
-                msg = f"⚡ Alert sent to {n} contacts  {hts}\n📍 {maps_link}"
+                msg = (f"⚡ Alert sent to {n} contacts  {hts}\n📍 {maps_link}"
+                       if n > 0 else "Alert was not delivered to any contacts")
                 self.after(0, lambda: self.lbl_alert.configure(
-                    text=msg, text_color=C_GREEN))
+                    text=msg, text_color=C_GREEN if n > 0 else C_RED))
             else:
                 self.after(0, lambda: self.lbl_alert.configure(
                     text=f"✗ Server error {r.status_code}", text_color=C_RED))
@@ -718,7 +724,8 @@ class VigilDriveFinal(ctk.CTk):
 
         ret, frame = self.cap.read()
         if not ret:
-            self.after(30, self.stream)
+            self.toggle()
+            self.lbl_code_ok.configure(text="Camera disconnected: restart monitoring", text_color=C_RED)
             return
 
         frame   = cv2.flip(frame, 1)

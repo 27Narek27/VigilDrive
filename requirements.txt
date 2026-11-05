@@ -1,0 +1,15 @@
+customtkinter
+opencv-python
+Pillow
+torch
+torchvision
+numpy
+sounddevice
+requests
+# main.py uses the legacy mp.solutions API.
+mediapipe==0.10.21
+fastapi
+uvicorn
+python-multipart
+pyTelegramBotAPI
+python-dotenv

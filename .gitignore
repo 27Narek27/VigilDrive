@@ -4,3 +4,8 @@ __pycache__/
 *.db
 vigil_model_v7_best.pth
 .idea/
+.venv/
+.env
+.env.*
+!.env.example
+*.log
